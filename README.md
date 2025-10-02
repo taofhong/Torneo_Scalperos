@@ -120,6 +120,9 @@ Se reinician participantes y leaderboard 5 min antes de iniciar.
 
 24h después del cierre (sábado 1:00 PM) se limpian credenciales.
 
+
+Vista desde Run Google https://chatgpt.com/g/g-p-68bf44eb2f4c8191b7030e65d8dba108/c/68d66f82-fcec-832f-8be0-4e6d267f2d26
+
 🛡️ Seguridad
 
 Comunicación autenticada mediante HMAC-SHA256 (opcional).
