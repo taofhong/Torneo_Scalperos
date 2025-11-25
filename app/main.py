@@ -5,6 +5,7 @@ from datetime import datetime, timezone, timedelta, date
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pathlib import Path
 from typing import Any, Dict, Optional, List
+print("🚨 app/main.py cargado. Estructura de rutas corregida. 🚨")
 
 # ---- .env opcional ----
 try:
@@ -18,14 +19,24 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import StreamingResponse, Response
 from pydantic import BaseModel, Field, EmailStr
+from fastapi.responses import FileResponse # Import para servir index.html
 
-from sqlalchemy import create_engine, String, Integer, Float, Boolean, DateTime
+from sqlalchemy import create_engine, String, Integer, Float, Boolean, DateTime, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-# ========= Config =========
+# ====================================================================
+# ========= CONFIGURACIÓN GLOBAL Y REGLAS ============================
+# ====================================================================
+
+# ========= Configuración DB =========
 DB_URL = "sqlite:///torneo.db"
 engine = create_engine(DB_URL, echo=False, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+# === REGLAS DEL TORNEO ===
+MAX_PARTICIPANTS = 20      # Límite de inscripción
+MAX_MICROS = 10            # Límite de tamaño de posición
+MAX_LOSS = -2000.0         # Límite de Stop Loss / Drawdown máximo (P&L acumulado)
 
 class Base(DeclarativeBase):
     pass
@@ -33,56 +44,29 @@ class Base(DeclarativeBase):
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-# ======== Zona horaria del torneo (Colombia) ========
+def compute_drawdown(peak: float, equity: float) -> float:
+    return min(0.0, equity - peak)
+
 try:
     TZ_CO = ZoneInfo("America/Bogota")
 except ZoneInfoNotFoundError:
-    print("[WARN] No se encontró America/Bogota, usando UTC")
     TZ_CO = timezone.utc
 
-# ========= Email =========
-EMAIL_ENABLED   = os.getenv("EMAIL_ENABLED", "true").lower() in ("1","true","yes")
-SMTP_HOST       = os.getenv("SMTP_HOST")
-SMTP_PORT       = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER       = os.getenv("SMTP_USER")
-SMTP_PASS       = os.getenv("SMTP_PASS")
-MAIL_FROM       = os.getenv("MAIL_FROM") or SMTP_USER or "no-reply@localhost"
-MAIL_TO_ADMIN   = os.getenv("MAIL_TO_ADMIN") or ""
-SEND_CONFIRM    = os.getenv("SEND_CONFIRM", "false").lower() in ("1","true","yes")
+# ====================================================================
+# ========= MODELOS DE BASE DE DATOS =================================
+# ====================================================================
 
-def send_email(subject: str, body: str, to_addrs: List[str]) -> None:
-    if not EMAIL_ENABLED:
-        return
-    if not (SMTP_HOST and SMTP_USER and SMTP_PASS and MAIL_FROM and to_addrs):
-        print("[MAIL] Falta configuración SMTP; no se envía.")
-        return
-    try:
-        msg = EmailMessage()
-        msg["Subject"] = subject
-        msg["From"]    = MAIL_FROM
-        msg["To"]      = ", ".join([a for a in to_addrs if a])
-        msg.set_content(body)
-        context = ssl.create_default_context()
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
-            server.starttls(context=context)
-            server.login(SMTP_USER, SMTP_PASS)
-            server.send_message(msg)
-        print(f"[MAIL] Enviado a {msg['To']}")
-    except Exception as e:
-        print("[MAIL] Error enviando correo:", e)
-
-# ========= Modelos DB =========
 class Participant(Base):
     __tablename__ = "participants"
-    id: Mapped[int]      = mapped_column(Integer, primary_key=True, autoincrement=True)
-    handle: Mapped[str]  = mapped_column(String(64), unique=True, index=True)
-    pnl: Mapped[float]   = mapped_column(Float, default=0.0)
-    trades: Mapped[int]  = mapped_column(Integer, default=0)
-    wins: Mapped[int]    = mapped_column(Integer, default=0)
-    losses: Mapped[int]  = mapped_column(Integer, default=0)
+    id: Mapped[int]     = mapped_column(Integer, primary_key=True, autoincrement=True)
+    handle: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    pnl: Mapped[float]  = mapped_column(Float, default=0.0)
+    trades: Mapped[int] = mapped_column(Integer, default=0)
+    wins: Mapped[int]   = mapped_column(Integer, default=0)
+    losses: Mapped[int] = mapped_column(Integer, default=0)
     max_dd: Mapped[float]= mapped_column(Float, default=0.0)
     peak_equity: Mapped[float]= mapped_column(Float, default=0.0)
-    last_symbol: Mapped[str]  = mapped_column(String(32), default="")
+    last_symbol: Mapped[str]   = mapped_column(String(32), default="")
     last_price:  Mapped[float]= mapped_column(Float, default=0.0)
     position_size: Mapped[int] = mapped_column(Integer, default=0)
     eliminated: Mapped[bool]   = mapped_column(Boolean, default=False)
@@ -109,22 +93,67 @@ class Registration(Base):
 
 class Credentials(Base):
     __tablename__ = "credentials"
-    api_key: Mapped[str]    = mapped_column(String(128), primary_key=True, index=True)
-    secret: Mapped[str]     = mapped_column(String(256))
-    handle: Mapped[str]     = mapped_column(String(64), index=True)
+    api_key: Mapped[str]     = mapped_column(String(128), primary_key=True, index=True)
+    secret: Mapped[str]      = mapped_column(String(256))
+    handle: Mapped[str]      = mapped_column(String(64), index=True)
     display_name: Mapped[str]= mapped_column(String(120))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
 
 Base.metadata.create_all(bind=engine)
 
-# ========= Helpers ENV/credenciales =========
+# ====================================================================
+# ========= HELPERS & LOGICA DE SEGURIDAD (HMAC) =====================
+# ====================================================================
+
+# Configuración de HMAC
+USE_HMAC = os.getenv("USE_HMAC", "true").lower() in ("1", "true", "yes")
+
+def compute_hmac(key: str, data: str, timestamp: str) -> str:
+    msg = f"{data}|{timestamp}".encode("utf-8")
+    signature = hmac.new(key.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    return signature
+
+# Configuración de Email
+EMAIL_ENABLED   = os.getenv("EMAIL_ENABLED", "true").lower() in ("1","true","yes")
+SMTP_HOST       = os.getenv("SMTP_HOST")
+SMTP_PORT       = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER       = os.getenv("SMTP_USER")
+SMTP_PASS       = os.getenv("SMTP_PASS")
+MAIL_FROM       = os.getenv("MAIL_FROM") or SMTP_USER or "no-reply@localhost"
+MAIL_TO_ADMIN   = os.getenv("MAIL_TO_ADMIN") or ""
+SEND_CONFIRM    = os.getenv("SEND_CONFIRM", "false").lower() in ("1","true","yes")
+
+def send_email(subject: str, body: str, to_addrs: List[str]) -> None:
+    if not EMAIL_ENABLED: return
+    if not (SMTP_HOST and SMTP_USER and SMTP_PASS and MAIL_FROM and to_addrs):
+        print("[MAIL] Falta configuración SMTP; no se envía.")
+        return
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"]    = MAIL_FROM
+        msg["To"]      = ", ".join([a for a in to_addrs if a])
+        msg.set_content(body)
+        context = ssl.create_default_context()
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls(context=context)
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        print(f"[MAIL] Enviado a {msg['To']}")
+    except Exception as e:
+        print("[MAIL] Error enviando correo:", e)
+
+# Helpers de Credenciales
 ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+REGISTRY_BY_KEY: dict[str, dict] = {} 
+DISPLAY_BY_HANDLE: dict[str, str] = {}
+LAST_HB: dict[str, dict] = {} 
 
 def generate_api_key() -> str: return uuid.uuid4().hex
 def generate_secret() -> str: return secrets.token_urlsafe(32)
 
 def update_env_credentials(creds: List[Credentials]):
-    """Reescribe API_CREDENTIALS y DISPLAY_NAMES en .env según la tabla credentials"""
+    """Actualiza API_CREDENTIALS y DISPLAY_NAMES en .env"""
     lines = []
     if ENV_PATH.exists():
         lines = ENV_PATH.read_text(encoding="utf-8").splitlines()
@@ -134,11 +163,6 @@ def update_env_credentials(creds: List[Credentials]):
     lines.append(f"API_CREDENTIALS={api_val}")
     lines.append(f"DISPLAY_NAMES={disp_val}")
     ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-# ========= Registro en memoria =========
-REGISTRY_BY_KEY: dict[str, dict] = {}      # api_key -> {secret, handle, display_name}
-DISPLAY_BY_HANDLE: dict[str, str] = {}     # handle -> display
-LAST_HB: dict[str, dict] = {}              # handle -> {"account_balance": float, "unrealized_pnl": float, "asof": str}
 
 def reload_registry_from_db():
     with SessionLocal() as db:
@@ -151,26 +175,52 @@ def reload_registry_from_db():
 def load_display_names_from_env():
     DISPLAY_BY_HANDLE.clear()
     names = (os.getenv("DISPLAY_NAMES") or "").strip()
-    if not names:
-        print("[BOOT] DISPLAY_NAMES vacío")
-        return
+    if not names: return
     for chunk in names.split(","):
         chunk = chunk.strip()
-        if not chunk:
-            continue
+        if not chunk: continue
         try:
             handle, disp = chunk.split(":", 1)
-            handle = handle.strip()
-            disp = (disp or "").strip()
-            DISPLAY_BY_HANDLE[handle] = disp or handle
+            DISPLAY_BY_HANDLE[handle.strip()] = (disp or handle).strip()
         except ValueError:
             print(f"[WARN] DISPLAY_NAMES mal formado: {chunk}")
     print(f"[BOOT] display names cargados: {len(DISPLAY_BY_HANDLE)}")
 
+def verify_hmac_headers(x_api_key: str, x_timestamp: str, x_signature: str, raw_body: str, handle: str) -> None:
+    """Verifica que la API Key y la firma sean válidas."""
+    if not USE_HMAC: return
+    
+    if not all([x_api_key, x_timestamp, x_signature]):
+        raise HTTPException(status_code=401, detail="Faltan encabezados de autenticación (API, TS, SIG)")
+
+    cred = REGISTRY_BY_KEY.get(x_api_key)
+    if not cred:
+        raise HTTPException(status_code=401, detail="API Key no reconocida")
+    
+    if cred["handle"] != handle:
+        raise HTTPException(status_code=401, detail="API Key no corresponde al Handle")
+
+    expected_sig = compute_hmac(cred["secret"], raw_body, x_timestamp)
+    if not hmac.compare_digest(x_signature, expected_sig):
+        raise HTTPException(status_code=401, detail="Firma HMAC no válida")
+    
+    # Simple check de tiempo (opcional: implementar más robusto)
+    try:
+        ts_diff = abs(int(x_timestamp) - int(datetime.now(timezone.utc).timestamp() * 1000))
+        if ts_diff > 300000: # 5 minutos
+            print(f"[WARN] Tiempo desfasado: {ts_diff/1000}s para {handle}")
+    except:
+        pass
+
+
 reload_registry_from_db()
 load_display_names_from_env()
 
-# ========= FastAPI & estáticos =========
+# ====================================================================
+# ========= FASTAPI, WS MANAGER & SCHEMAS ============================
+# ====================================================================
+
+# Inicialización de FastAPI
 app = FastAPI(title="Torneo WS Demo")
 app.add_middleware(
     CORSMiddleware,
@@ -178,125 +228,117 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-STATIC_DIR = (Path(__file__).resolve().parent.parent / "web").resolve()
+# Definición de Static Dir
+project_root = Path(os.getcwd())
+STATIC_DIR = project_root / "web"
 
-class StaticFilesWithPost(StaticFiles):
-    async def get_response(self, path, scope):
-        if scope.get("method") == "POST":
-            return Response(status_code=204)
-        return await super().get_response(path, scope)
-
-app.mount("/web", StaticFilesWithPost(directory=str(STATIC_DIR), html=True), name="web")
-
-# ========= WS Manager =========
+# WS Manager para manejar conexiones activas
 class WSManager:
     def __init__(self):
-        self.active: List[WebSocket] = []
+        self.active_connections: List[WebSocket] = []
+        self.broadcast_queue = asyncio.Queue()
 
-    async def connect(self, ws: WebSocket):
-        await ws.accept()
-        self.active.append(ws)
-        print("INFO:     connection open")
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
 
-    def disconnect(self, ws: WebSocket):
-        if ws in self.active:
-            self.active.remove(ws)
+    def disconnect(self, websocket: WebSocket):
+        try:
+            self.active_connections.remove(websocket)
+        except ValueError:
+            pass
 
-    async def broadcast(self, data: Any):
-        stale = []
-        for ws in self.active:
+    async def broadcast(self, message: Any):
+        if not isinstance(message, str):
+            message = json.dumps(message)
+        
+        dead_connections = []
+        for connection in self.active_connections:
             try:
-                await ws.send_json(data)
-            except Exception:
-                stale.append(ws)
-        for ws in stale:
-            self.disconnect(ws)
+                await connection.send_text(message)
+            except WebSocketDisconnect:
+                dead_connections.append(connection)
+            except RuntimeError: # Para manejar "WebSocket has not been accepted"
+                 dead_connections.append(connection)
+        
+        for connection in dead_connections:
+            self.disconnect(connection)
 
 manager = WSManager()
 
-# ========= Schemas =========
+# Schemas para Pydantic
+class Heartbeat(BaseModel):
+    handle: str
+    account_balance: float
+    unrealized_pnl: float
+
 class TradeEvent(BaseModel):
     handle: str
     symbol: str
     qty: int
     price: float
-    position_size: int = Field(..., description="Tamaño de posición tras la ejecución (micros)")
+    position_size: int = Field(..., description="Tamaño de la posición después del trade")
     realized_pnl: float
-    ts: Optional[int] = Field(None, description="timestamp en milisegundos (opcional)")
-    order_id: Optional[str] = None
-    seq: Optional[int] = None
+    ts: Optional[int] = None
 
-class Heartbeat(BaseModel):
-    handle: str
-    account_balance: float
-    unrealized_pnl: float
-    seq: int
-    ts: int
+class RegistrationIn(BaseModel):
+    name: str
+    email: EmailStr
 
-# ========= Reglas =========
-MAX_MICROS = 10
-MAX_LOSS   = -2000.0
-
-def compute_drawdown(peak: float, equity: float) -> float:
-    return min(0.0, equity - peak)  # negativo o 0
-
+# Función para dar formato a los datos del participante
 def participant_to_row(p: Participant) -> Dict[str, Any]:
-    winrate = (p.wins / p.trades * 100.0) if p.trades > 0 else 0.0
-    display = DISPLAY_BY_HANDLE.get(p.handle, p.handle)
-
-    hb = LAST_HB.get(p.handle) or {}
-    bal = hb.get("account_balance")
-    unreal = hb.get("unrealized_pnl")
-
+    # Usamos el display_name para mostrar el nombre de pila
+    display_name = DISPLAY_BY_HANDLE.get(p.handle, p.handle)
+    
+    # Formateo de hora local para la tabla
+    local_time_str = ""
+    if p.updated_at:
+        local_time = p.updated_at.astimezone(TZ_CO)
+        local_time_str = local_time.strftime("%I:%M:%S %p")
+        
     return {
         "handle": p.handle,
-        "display_name": display,
+        "display_name": display_name,
         "pnl": round(p.pnl, 2),
         "trades": p.trades,
-        "winrate": round(winrate, 1),
+        "wins": p.wins,
+        "losses": p.losses,
         "max_dd": round(p.max_dd, 2),
         "position_size": p.position_size,
-        "eliminated": p.eliminated,
-        "updated_at": p.updated_at.isoformat(),
-        # extras UI
-        "last_symbol": p.last_symbol,
-        "last_price": round(p.last_price, 2) if p.last_price is not None else None,
-        "account_balance": float(bal) if bal is not None else None,
-        "unrealized_pnl": float(unreal) if unreal is not None else None,
+        "last_trade": local_time_str,
+        "is_eliminated": p.eliminated, # Aquí se envía el estado de descalificación
     }
 
-# ========= Seguridad (HMAC) opcional =========
-USE_HMAC = os.getenv("USE_HMAC", "false").lower() in ("1","true","yes")
+# ====================================================================
+# ========= ENDPOINTS HTTP (RUTAS REST) ==============================
+# ====================================================================
 
-def verify_hmac_headers(
-    x_api_key: str | None,
-    x_timestamp: str | None,
-    x_signature: str | None,
-    raw_body: str,
-    claimed_handle: str | None
-):
-    if not USE_HMAC:
-        return
-    if not x_api_key or not x_timestamp or not x_signature:
-        raise HTTPException(status_code=401, detail="missing hmac headers")
+# === 1. RUTA RAIZ HTTP (Soluciona 404/403) ===
+@app.get("/")
+async def serve_index():
+    """Sirve el index.html en la raíz para evitar conflicto con WS/StaticFiles."""
+    index_path = STATIC_DIR / "index.html"
+    if not index_path.is_file():
+        raise HTTPException(status_code=404, detail="index.html no encontrado.")
+    return FileResponse(index_path)
+# ============================================
 
-    info = REGISTRY_BY_KEY.get(x_api_key)
-    if not info:
-        raise HTTPException(status_code=401, detail="unknown api key")
-
-    if claimed_handle and info.get("handle") != claimed_handle:
-        raise HTTPException(status_code=401, detail="key/handle mismatch")
-
-    secret = info.get("secret", "")
-    msg = f"{x_timestamp}.{raw_body}".encode("utf-8")
-    expected = hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected, x_signature):
-        raise HTTPException(status_code=401, detail="bad signature")
-
-# ========= REST =========
 @app.get("/ping")
 def ping():
     return {"ok": True, "ts": now_utc().isoformat(), "hmac": USE_HMAC, "participants": len(REGISTRY_BY_KEY)}
+
+# === 2. RUTA DE ESTADO (Límite de Inscripción) ===
+@app.get("/status")
+def get_tournament_status():
+    """Ruta para que el frontend obtenga el conteo de inscripciones."""
+    with SessionLocal() as db:
+        current_count = db.query(func.count(Registration.id)).scalar()
+        
+    return {
+        "participants": current_count,
+        "max_participants": MAX_PARTICIPANTS,
+        "is_full": current_count >= MAX_PARTICIPANTS
+    }
 
 @app.get("/leaderboard")
 def get_leaderboard():
@@ -305,34 +347,60 @@ def get_leaderboard():
     rows.sort(key=lambda r: r["pnl"], reverse=True)
     return {"type": "leaderboard", "asof": now_utc().isoformat(), "rows": rows}
 
-@app.post("/events/heartbeat")
-async def heartbeat(
-    hb: Heartbeat,
-    request: Request,
-    x_api_key: str | None = Header(None),
-    x_timestamp: str | None = Header(None),
-    x_signature: str | None = Header(None),
-):
-    raw = (await request.body()).decode("utf-8")
-    verify_hmac_headers(x_api_key, x_timestamp, x_signature, raw, hb.handle)
-    print(f"[HB] {hb.handle} bal={hb.account_balance:.2f} unreal={hb.unrealized_pnl:.2f} seq={hb.seq}")
+# === 3. RUTA DE INSCRIPCIÓN (Con Límite de 20) ===
+@app.post("/register")
+def register_user(data: RegistrationIn, background: BackgroundTasks):
+    name = (data.name or "").strip()
+    email = (data.email or "").strip().lower()
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+        
+    with SessionLocal() as db:
+        # Límite de 20 Personas
+        current_count = db.query(Registration).count()
+        if current_count >= MAX_PARTICIPANTS:
+            raise HTTPException(
+                status_code=403, 
+                detail=f"Inscripciones llenas. El límite de {MAX_PARTICIPANTS} participantes ha sido alcanzado."
+            )
+        
+        # Verificar si ya existe
+        existing = db.query(Registration).filter_by(email=email).one_or_none()
+        if existing:
+            return {"ok": True, "message": "Ya estabas inscrito con este correo. Tus credenciales son las mismas."}
+            
+        # Crear Registration
+        r = Registration(name=name, email=email)
+        db.add(r); db.commit()
 
-    # Guardar último heartbeat (para mostrar Saldo en tarjetas)
-    LAST_HB[hb.handle] = {
-        "account_balance": hb.account_balance,
-        "unrealized_pnl": hb.unrealized_pnl,
-        "asof": now_utc().isoformat()
-    }
+        # Generar Credenciales
+        handle = "P" + uuid.uuid4().hex[:8]
+        api_key = generate_api_key(); secret = generate_secret()
+        cred = Credentials(api_key=api_key, secret=secret, handle=handle, display_name=name)
+        db.add(cred); db.commit()
 
-    await manager.broadcast({
-        "type": "heartbeat",
-        "handle": hb.handle,
-        "account_balance": hb.account_balance,
-        "unrealized_pnl": hb.unrealized_pnl,
-        "asof": now_utc().isoformat()
-    })
-    return {"ok": True}
+        # Actualizar ENVs y registros en memoria
+        creds = db.query(Credentials).all()
+        update_env_credentials(creds)
+        
+    reload_registry_from_db()
+    load_display_names_from_env()
 
+    # Enviar Correo con Llaves
+    body = (
+        f"Hola {name},\n\n"
+        "Bienvenido a uno de los torneos más importantes de trading en Latinoamérica.\n"
+        "RECUERDA LAS REGLAS DE DESCALIFICACIÓN: 1) Máximo 10 micros. 2) Pérdida máxima de -$2000 USD.\n\n"
+        f"Tus credenciales de conexión son:\nHandle: {handle}\nAPI_KEY: {api_key}\nSECRET: {secret}\n"
+    )
+    background.add_task(send_email, "✅ Credenciales Torneo Scalperos", body, [email]) 
+
+    if MAIL_TO_ADMIN:
+        background.add_task(send_email, "Nueva inscripción", f"{name} <{email}> se ha inscrito.", [MAIL_TO_ADMIN])
+
+    return {"ok": True, "message": "Inscripción registrada. Revisa tu correo para tus credenciales."}
+
+# === 4. RUTA DE TRADE (Con Reglas de Descalificación) ===
 @app.post("/events/trade")
 async def post_trade(
     ev: TradeEvent,
@@ -342,10 +410,10 @@ async def post_trade(
     x_signature: str | None = Header(None),
 ):
     raw = (await request.body()).decode("utf-8")
+    # Autenticación de HMAC
     verify_hmac_headers(x_api_key, x_timestamp, x_signature, raw, ev.handle)
 
     ts = datetime.fromtimestamp(ev.ts / 1000.0, tz=timezone.utc) if ev.ts else now_utc()
-    print("[TRADE]", ev.handle, ev.symbol, ev.qty, ev.price, ev.position_size, ev.realized_pnl)
 
     with SessionLocal() as db:
         p = db.query(Participant).filter_by(handle=ev.handle).one_or_none()
@@ -353,28 +421,35 @@ async def post_trade(
             p = Participant(handle=ev.handle)
             db.add(p); db.flush()
 
-        # Reglas
-        if abs(ev.position_size) > MAX_MICROS:
-            p.eliminated = True
+        # --- APLICACIÓN DE REGLAS DE DESCALIFICACIÓN ---
+        if not p.eliminated:
+            # Regla 1: Límite de Micros
+            if abs(ev.position_size) > MAX_MICROS:
+                p.eliminated = True
+                print(f"[RULE FAIL] {p.handle}: Exceso de micros ({abs(ev.position_size)} > {MAX_MICROS})")
 
+        # Actualizar estadísticas
         new_pnl = p.pnl + ev.realized_pnl
         p.trades += 1
-        if ev.realized_pnl >= 0: p.wins += 1
-        else: p.losses += 1
+        p.wins += (1 if ev.realized_pnl >= 0 else 0)
+        p.losses += (1 if ev.realized_pnl < 0 else 0)
 
         p.peak_equity = max(p.peak_equity, new_pnl)
         dd = compute_drawdown(p.peak_equity, new_pnl)
         p.max_dd = min(p.max_dd, dd)
-
         p.pnl = new_pnl
+
+        # Regla 2: Límite de Pérdida Máxima ($2000)
+        if not p.eliminated and p.pnl <= MAX_LOSS:
+            p.eliminated = True
+            print(f"[RULE FAIL] {p.handle}: Pérdida máxima alcanzada ({p.pnl} <= {MAX_LOSS})")
+            
         p.position_size = ev.position_size
         p.updated_at = now_utc()
         p.last_symbol = ev.symbol
         p.last_price  = ev.price
 
-        if p.pnl <= MAX_LOSS:
-            p.eliminated = True
-
+        # Guardar el trade
         t = Trade(
             ts=ts, handle=ev.handle, symbol=ev.symbol, qty=ev.qty, price=ev.price,
             position_size_after=ev.position_size, realized_pnl=ev.realized_pnl,
@@ -382,6 +457,7 @@ async def post_trade(
         )
         db.add(t); db.commit()
 
+        # Preparar y enviar Leaderboard
         rows = [participant_to_row(x) for x in db.query(Participant).all()]
         rows.sort(key=lambda r: r["pnl"], reverse=True)
         payload = {"type": "leaderboard", "asof": now_utc().isoformat(), "rows": rows}
@@ -389,185 +465,27 @@ async def post_trade(
     await manager.broadcast(payload)
     return {"ok": True}
 
-# ========= Inscripción pública =========
-class RegistrationIn(BaseModel):
-    name: str
-    email: EmailStr
+# ====================================================================
+# ========= WEB SOCKET ===============================================
+# ====================================================================
 
-@app.post("/register")
-def register_user(data: RegistrationIn, background: BackgroundTasks):
-    name = (data.name or "").strip()
-    email = (data.email or "").strip().lower()
-    if not name:
-        raise HTTPException(status_code=400, detail="name required")
-    with SessionLocal() as db:
-        existing = db.query(Registration).filter_by(email=email).one_or_none()
-        if existing:
-            return {"ok": True, "message": "Ya estabas inscrito con este correo."}
-        r = Registration(name=name, email=email)
-        db.add(r); db.commit()
-
-        handle = "P" + uuid.uuid4().hex[:8]
-        api_key = generate_api_key(); secret = generate_secret()
-        cred = Credentials(api_key=api_key, secret=secret, handle=handle, display_name=name)
-        db.add(cred); db.commit()
-
-        creds = db.query(Credentials).all()
-        update_env_credentials(creds)
-    reload_registry_from_db()
-    load_display_names_from_env()
-
-    body = (
-        f"Hola {name},\n\n"
-        "Bienvenido a uno de los torneos más importantes de trading en Latinoamérica, diviértete.\n"
-        "Scalperos Torneo.\n\n"
-        f"Estas son tus credenciales:\nHandle: {handle}\nAPI_KEY: {api_key}\nSECRET: {secret}\n"
-    )
-    background.add_task(send_email, "Bienvenido — Scalperos Torneo", body, [email])
-
-    if MAIL_TO_ADMIN:
-        background.add_task(send_email, "Nueva inscripción", f"{name} <{email}> se ha inscrito.", [MAIL_TO_ADMIN])
-
-    return {"ok": True, "message": "Inscripción registrada. Revisa tu correo para tus credenciales."}
-
-# ========= Admin =========
-@app.post("/admin/reset")
-def admin_reset(handle: str, token: str = Header(None)):
-    admin_token = os.getenv("ADMIN_TOKEN")
-    if admin_token and token != admin_token:
-        raise HTTPException(status_code=401, detail="bad admin token")
-    with SessionLocal() as db:
-        p = db.query(Participant).filter_by(handle=handle).one_or_none()
-        if not p:
-            return {"ok": False, "detail": "handle not found"}
-        p.pnl = 0.0; p.trades = 0; p.wins = 0; p.losses = 0
-        p.max_dd = 0.0; p.peak_equity = 0.0; p.position_size = 0
-        p.last_symbol = ""; p.last_price = 0.0
-        p.eliminated = False; p.updated_at = now_utc()
-        db.commit()
-    return {"ok": True, "handle": handle}
-
-@app.get("/admin/registrations")
-def list_registrations(token: str = Header(None)):
-    admin_token = os.getenv("ADMIN_TOKEN")
-    if admin_token and token != admin_token:
-        raise HTTPException(status_code=401, detail="bad admin token")
-    with SessionLocal() as db:
-        rows = db.query(Registration).order_by(Registration.created_at.desc()).all()
-        return {"ok": True, "rows": [
-            {"id": r.id, "name": r.name, "email": r.email, "created_at": r.created_at.isoformat()}
-            for r in rows
-        ]}
-
-@app.get("/admin/export_csv")
-def export_csv(token: str = Header(None)):
-    admin_token = os.getenv("ADMIN_TOKEN")
-    if admin_token and token != admin_token:
-        raise HTTPException(status_code=401, detail="bad admin token")
-    with SessionLocal() as db:
-        rows = db.query(Registration).order_by(Registration.created_at.desc()).all()
-
-    sio = io.StringIO()
-    writer = csv.writer(sio)
-    writer.writerow(["id", "name", "email", "created_at_utc"])
-    for r in rows:
-        writer.writerow([r.id, r.name, r.email, r.created_at.isoformat()])
-
-    sio.seek(0)
-    headers = {"Content-Disposition": "attachment; filename=registrations.csv"}
-    return StreamingResponse(iter([sio.read()]), media_type="text/csv", headers=headers)
-
-@app.post("/admin/upsert_credential")
-def admin_upsert_credential(
-    handle: str,
-    api_key: str,
-    secret: str,
-    display_name: str,
-    token: str = Header(None)
-):
-    admin_token = os.getenv("ADMIN_TOKEN")
-    if admin_token and token != admin_token:
-        raise HTTPException(status_code=401, detail="bad admin token")
-
-    handle = handle.strip(); api_key = api_key.strip(); secret = secret.strip(); display_name = display_name.strip()
-    if not (handle and api_key and secret and display_name):
-        raise HTTPException(status_code=400, detail="missing fields")
-
-    with SessionLocal() as db:
-        cred = db.query(Credentials).filter_by(api_key=api_key).one_or_none()
-        if cred:
-            cred.handle = handle
-            cred.secret = secret
-            cred.display_name = display_name
-        else:
-            cred = Credentials(api_key=api_key, secret=secret, handle=handle, display_name=display_name)
-            db.add(cred)
-        db.commit()
-        creds = db.query(Credentials).all()
-        update_env_credentials(creds)
-
-    reload_registry_from_db()
-    load_display_names_from_env()
-    return {"ok": True, "handle": handle, "display_name": display_name}
-
-@app.post("/admin/reload_display_names")
-def admin_reload_display_names(token: str = Header(None)):
-    admin_token = os.getenv("ADMIN_TOKEN")
-    if admin_token and token != admin_token:
-        raise HTTPException(status_code=401, detail="bad admin token")
-    load_display_names_from_env()
-    return {"ok": True, "count": len(DISPLAY_BY_HANDLE), "display_by_handle": DISPLAY_BY_HANDLE}
-
-# ========= WebSocket =========
 @app.websocket("/ws/leaderboard")
 async def ws_leaderboard(ws: WebSocket):
     await manager.connect(ws)
     try:
         await ws.send_json({"type": "hello", "ts": now_utc().isoformat()})
-        with SessionLocal() as db:
-            rows = [participant_to_row(p) for p in db.query(Participant).all()]
-        rows.sort(key=lambda r: r["pnl"], reverse=True)
-        await ws.send_json({"type": "leaderboard", "asof": now_utc().isoformat(), "rows": rows})
-
         while True:
-            await asyncio.sleep(5)
-            await ws.send_json({"type": "ping", "ts": now_utc().isoformat()})
+            # Este loop mantendrá la conexión viva y recibirá mensajes (si los hay)
+            await ws.receive_text() 
     except WebSocketDisconnect:
         manager.disconnect(ws)
-    except Exception:
+    except Exception as e:
+        print(f"[WS ERROR] {e}")
         manager.disconnect(ws)
 
-# ========= Debug =========
-@app.get("/debug/auth")
-def debug_auth():
-    safe = { k: {"handle": v["handle"], "display_name": v.get("display_name")} for k, v in REGISTRY_BY_KEY.items() }
-    return {"registry_size": len(REGISTRY_BY_KEY), "by_key": safe, "display_by_handle": DISPLAY_BY_HANDLE}
+# ====================================================================
+# ========= MONTAJE DE ARCHIVOS ESTÁTICOS (FINAL) ====================
+# ====================================================================
 
-# ========= Scheduler (limpieza sábado post torneo) =========
-def clear_all_credentials():
-    with SessionLocal() as db:
-        db.query(Credentials).delete()
-        db.commit()
-        update_env_credentials([])
-    reload_registry_from_db()
-    print("[RESET] Credenciales borradas.")
-
-async def _reset_scheduler_loop():
-    while True:
-        try:
-            now = now_utc().astimezone(TZ_CO)
-            weekday = now.weekday()  # 5 = sábado
-            if weekday == 5 and now.hour >= 13:  # 24h después del cierre del viernes 1pm
-                print("[SCHED] Limpiando tablero + credenciales…")
-                clear_all_credentials()
-                with SessionLocal() as db:
-                    db.query(Participant).delete()
-                    db.query(Trade).delete()
-                    db.commit()
-        except Exception as e:
-            print("[SCHED] error:", e)
-        await asyncio.sleep(3600)
-
-@app.on_event("startup")
-async def _startup():
-    asyncio.create_task(_reset_scheduler_loop())
+# Montaje de archivos estáticos en /static-files (Solución al conflicto)
+app.mount("/static-files", StaticFiles(directory=STATIC_DIR), name="static")

@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Torneo Scalperos - FINAL</title>
+  <link rel="stylesheet" href="/static-files/styles_v2.css?v=99" />
+</head>
+<body>
+  <div class="hero">
+    <img src="/static-files/assets/escalperos_logo.png" alt="Scalperos — Torneo" class="hero-logo animate-in" />
+    <div id="timer" class="timer">
+      <div class="timer-count">Cargando…</div>
+      <div class="timer-sub">28 Nov 2025 — 9:00 AM → 1:00 PM (Hora Colombia)</div>
+    </div>
+  </div>
+
+  <div class="cta-wrap">
+    <button id="btnOpenForm" class="cta-brand">Inscríbete</button>
+  </div>
+  
+  <div class="rules-section">
+    <h3>🚨 Reglas de Descalificación Automática 🚨</h3>
+    <ul id="rulesList">
+      <li>**Límite de Participantes:** 20 personas (cupos limitados).</li>
+      <li>**REGLA 1 (Tamaño):** No puedes usar más de **10 micros** por contrato/operación.</li>
+      <li>**REGLA 2 (Riesgo):** La pérdida acumulada (P&L) **no puede exceder los $2000 USD** (si tu P&L es $\le -\$2000.00$, serás descalificado).</li>
+    </ul>
+  </div>
+
+  <div id="log" class="log"></div>
+
+  <div id="grid" class="grid"></div>
+
+  <div id="modal" class="modal" aria-hidden="true">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="titleIns">
+      <button class="modal-close" id="btnCloseModal" aria-label="Cerrar">×</button>
+      <h2 id="titleIns" class="modal-title">Inscripción</h2>
+      <div id="formRegister" class="form" role="form" aria-label="Formulario de inscripción">
+        <label class="field">
+          <span>Nombre</span>
+          <input type="text" id="inpName" required maxlength="120" placeholder="Tu nombre" autocomplete="off" />
+        </label>
+        <label class="field">
+          <span>Correo</span>
+          <input type="email" id="inpEmail" required maxlength="200" placeholder="tu@correo.com" autocomplete="off" />
+        </label>
+        <button type="button" id="btnSend" class="btn-submit breathe blink">Enviar</button>
+        <div id="formMsg" class="form-msg" role="alert"></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+console.log('client_v2 v99 - ARCHIVO FINAL Y DEFINITIVO');
+
+document.addEventListener('DOMContentLoaded', () => {
+  console.log("DOM Cargado. Inicializando script final...");
+
+  const $ = s => document.querySelector(s);
+  const logEl = $("#log");
+  const btnOpenForm = $("#btnOpenForm");
+
+  // ===== FUNCIÓN PARA ESCRIBIR EN EL LOG =====
+  function writeLog(message) {
+    const ts = new Date().toLocaleTimeString();
+    logEl.innerHTML += `<div>[${ts}] ${message}</div>`;
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+  writeLog("Cliente iniciado.");
+
+  // ===== LÓGICA DE TEMPORIZADOR (SIN ERRORES DE SINTAXIS) =====
+  function fmtDHMS(ms){ 
+    if(ms < 0) ms=0; 
+    let s=Math.floor(ms/1000); 
+    
+    const d=Math.floor(s/86400); 
+    s %= 86400;
+    
+    const h=Math.floor(s/3600); 
+    s %= 3600;
+    
+    const m=Math.floor(s/60); 
+    const sec=s % 60;
+
+    const timeStr = `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
+    
+    return d > 0 ? `${d}d ${timeStr}` : timeStr;
+  }
+
+  // **** FECHAS ACTUALIZADAS: 28 de Noviembre de 2025 ****
+  const START_UTC = Date.UTC(2025, 10, 28, 14, 0, 0); 
+  const END_UTC   = Date.UTC(2025, 10, 28, 18, 0, 0); 
+  // ****************************************************
+
+  function updateTimer(){
+    const el=$("#timer"); 
+    const c=el?.querySelector('.timer-count'); 
+    const sub=el?.querySelector('.timer-sub'); 
+    
+    if(!c || !sub) return;
+    
+    const now=Date.now();
+    c.classList.remove('critical');
+    
+    if(now < START_UTC){ 
+      const r = START_UTC - now;
+      c.textContent=`Inicia en ${fmtDHMS(r)}`; 
+      sub.textContent = '28 Nov 2025 — 9:00 AM → 1:00 PM (Hora Colombia)';
+    }
+    else if(now <= END_UTC){ 
+      const r = END_UTC - now; 
+      c.textContent=`Termina en ${fmtDHMS(r)}`; 
+      sub.textContent = '¡TORNEO EN VIVO! (Finaliza 1:00 PM COL)';
+      if(r <= 10*60*1000) c.classList.add('critical');
+    }
+    else{ 
+      c.textContent='Torneo Finalizado'; 
+      sub.textContent = 'El torneo ha concluido.';
+    }
+  }
+
+  setInterval(updateTimer, 1000); 
+  updateTimer();
+  console.log("Temporizador iniciado.");
+
+  // ===== LÓGICA DE LÍMITE DE INSCRIPCIONES =====
+  const originalOpenModal = () => { openModal(); };
+
+  async function checkRegistrationLimit() {
+    try {
+      const response = await fetch('/status');
+      const data = await response.json();
+      
+      writeLog(`Inscritos: ${data.participants}/${data.max_participants}`);
+
+      if (data.is_full) {
+        btnOpenForm.textContent = `Inscripciones Llenas (${data.max_participants} cupos)`;
+        btnOpenForm.disabled = true;
+        btnOpenForm.classList.remove('cta-brand');
+        btnOpenForm.classList.add('cta-disabled');
+        btnOpenForm.removeEventListener('click', originalOpenModal); 
+        writeLog('🚫 Límite de inscripción alcanzado (20).');
+      } else {
+        btnOpenForm.textContent = 'Inscríbete';
+        btnOpenForm.disabled = false;
+        btnOpenForm.classList.remove('cta-disabled');
+        btnOpenForm.classList.add('cta-brand');
+        btnOpenForm.removeEventListener('click', originalOpenModal);
+        btnOpenForm.addEventListener('click', originalOpenModal);
+      }
+
+    } catch (error) {
+      writeLog(`🚨 Error al verificar el límite: ${error.message}`);
+    }
+  }
+
+  checkRegistrationLimit();
+  setInterval(checkRegistrationLimit, 30000); 
+
+  // ===== MODAL Y FORMULARIO =====
+  const modal = $("#modal");
+  const btnClose = $("#btnCloseModal");
+  const btnSend = $("#btnSend");
+  const inpName = $("#inpName");
+  const inpEmail = $("#inpEmail");
+  const msgBox = $("#formMsg");
+
+  function openModal(){ modal?.classList.add('open'); inpName?.focus(); }
+  function closeModal(){ 
+    modal?.classList.remove('open'); 
+    inpName.value=''; inpEmail.value=''; 
+    msgBox.textContent=''; msgBox?.classList.remove('ok', 'neg'); 
+  }
+
+  btnClose?.addEventListener('click', closeModal);
+  modal?.addEventListener('click', e=>{ if(e.target===modal) closeModal(); });
+  addEventListener('keydown', e=>{ if(e.key==='Escape' && modal?.classList.contains('open')) closeModal(); });
+
+  btnSend?.addEventListener('click', async ()=>{
+    const name=inpName?.value.trim(), email=inpEmail?.value.trim();
+    if(!name || !email){ 
+        msgBox.textContent='Completa todos los campos.'; 
+        msgBox?.classList.remove('ok'); msgBox?.classList.add('neg'); 
+        return; 
+    }
+    
+    msgBox.textContent = 'Enviando...';
+    msgBox?.classList.remove('ok', 'neg');
+    
+    try {
+        writeLog(`Intentando registro para ${email}...`);
+        const response = await fetch('/register', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, email })
+        });
+        const data = await response.json();
+        
+        if (response.ok) {
+            msgBox.textContent = data.message || 'Inscripción exitosa. Revisa tu correo para tus credenciales.';
+            msgBox?.classList.add('ok');
+            writeLog(`✅ Registro exitoso para ${email}.`);
+            setTimeout(()=>{
+                closeModal();
+                checkRegistrationLimit(); 
+            }, 4000); 
+        } else if (response.status === 403) {
+             msgBox.textContent = data.detail || 'Inscripciones llenas. No se pudo registrar.';
+             msgBox?.classList.add('neg');
+             checkRegistrationLimit(); 
+        } 
+        else {
+            msgBox.textContent = data.detail || data.message || 'Error al registrar la inscripción.';
+            msgBox?.classList.add('neg');
+            writeLog(`❌ Error en registro: ${data.detail || data.message}`);
+        }
+    } catch (error) {
+        msgBox.textContent = 'Error de conexión con el servidor.';
+        msgBox?.classList.add('neg');
+        writeLog(`❌ Error de conexión al registrar: ${error.message}`);
+    }
+  });
+  
+  // ===== CONEXIÓN WEB SOCKET =====
+  function startWebSocket() {
+    const wsUrl = (window.location.protocol === "https:" ? "wss://" : "ws://") + window.location.host + "/ws/leaderboard";
+    const ws = new WebSocket(wsUrl);
+
+    ws.onopen = () => { writeLog("🌐 WebSocket Conectado."); };
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === "hello") { writeLog("✅ WS: Mensaje 'hello' recibido."); } 
+        else if (data.type === "leaderboard") {
+          writeLog(`📊 WS: Leaderboard actualizado (${data.rows.length} participantes).`);
+        } else if (data.type !== "ping") {
+          writeLog(`❓ WS: Dato desconocido recibido: ${data.type}`);
+        }
+      } catch (e) {
+        writeLog(`⚠️ WS: Error al parsear datos: ${e.message}`);
+      }
+    };
+    ws.onclose = () => { writeLog("🛑 WebSocket Desconectado. Reconectando en 5s..."); setTimeout(startWebSocket, 5000); };
+    ws.onerror = (err) => { writeLog(`🚨 WS: Error: ${err.message || 'Desconocido'}`); };
+  }
+
+  startWebSocket();
+});
+</script>
+</body>
+</html>
