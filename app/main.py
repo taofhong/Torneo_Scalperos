@@ -1,11 +1,14 @@
 from __future__ import annotations
-import os, json, hmac, hashlib, asyncio, csv, io, smtplib, ssl, secrets, uuid
-from email.message import EmailMessage
+import os, json, hmac, hashlib, asyncio, csv, io, secrets, uuid # smtplib y ssl ya no se necesitan
 from datetime import datetime, timezone, timedelta, date
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pathlib import Path
 from typing import Any, Dict, Optional, List
-print("🚨 app/main.py cargado. Estructura de rutas corregida. 🚨")
+
+# NUEVA IMPORTACIÓN NECESARIA para llamadas HTTP a la API de SendGrid
+import requests 
+
+print("🚨 app/main.py cargado. Usando API de Correo (SendGrid). 🚨")
 
 # ---- .env opcional ----
 try:
@@ -19,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import StreamingResponse, Response
 from pydantic import BaseModel, Field, EmailStr
-from fastapi.responses import FileResponse # Import para servir index.html
+from fastapi.responses import FileResponse 
 
 from sqlalchemy import create_engine, String, Integer, Float, Boolean, DateTime, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
@@ -34,9 +37,9 @@ engine = create_engine(DB_URL, echo=False, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 # === REGLAS DEL TORNEO ===
-MAX_PARTICIPANTS = 20       # Límite de inscripción
-MAX_MICROS = 10             # Límite de tamaño de posición
-MAX_LOSS = -2000.0          # Límite de Stop Loss / Drawdown máximo (P&L acumulado)
+MAX_PARTICIPANTS = 20       
+MAX_MICROS = 10             
+MAX_LOSS = -2000.0          
 
 class Base(DeclarativeBase):
     pass
@@ -113,41 +116,53 @@ def compute_hmac(key: str, data: str, timestamp: str) -> str:
     signature = hmac.new(key.encode("utf-8"), msg, hashlib.sha256).hexdigest()
     return signature
 
-# Configuración de Email
+# Configuración de Email (USANDO SENDGRID API)
 EMAIL_ENABLED   = os.getenv("EMAIL_ENABLED", "true").lower() in ("1","true","yes")
-SMTP_HOST       = os.getenv("SMTP_HOST")
-SMTP_PORT       = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER       = os.getenv("SMTP_USER")
-SMTP_PASS       = os.getenv("SMTP_PASS")
-MAIL_FROM       = os.getenv("MAIL_FROM") or SMTP_USER or "no-reply@localhost"
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY") # CLAVE API
+MAIL_FROM       = os.getenv("MAIL_FROM") or "no-reply@localhost"
 MAIL_TO_ADMIN   = os.getenv("MAIL_TO_ADMIN") or ""
 SEND_CONFIRM    = os.getenv("SEND_CONFIRM", "false").lower() in ("1","true","yes")
+SENDGRID_ENDPOINT = "https://api.sendgrid.com/v3/mail/send" # Endpoint fijo
 
 def send_email(subject: str, body: str, to_addrs: List[str]) -> None:
-    if not EMAIL_ENABLED: return
-    if not (SMTP_HOST and SMTP_USER and SMTP_PASS and MAIL_FROM and to_addrs):
-        print("[MAIL] Falta configuración SMTP; no se envía.")
+    """Envía correo usando la API de SendGrid (Solución a Timeout/Bloqueo)."""
+    if not EMAIL_ENABLED or not SENDGRID_API_KEY:
+        print("[MAIL] Falta configuración de API Key de SendGrid; no se envía.")
         return
+
+    recipient_email = next((addr for addr in to_addrs if addr), None)
+    if not recipient_email: return
+
+    # Payload de la API de SendGrid
+    payload = {
+        "personalizations": [{
+            "to": [{"email": recipient_email}],
+            "subject": subject
+        }],
+        # Nota: El email en MAIL_FROM debe estar verificado en SendGrid
+        "from": {"email": MAIL_FROM, "name": "Torneo Scalperos"}, 
+        "content": [{"type": "text/plain", "value": body}]
+    }
+
+    headers = {
+        "Authorization": f"Bearer {SENDGRID_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
     try:
-        msg = EmailMessage()
-        msg["Subject"] = subject
-        msg["From"]    = MAIL_FROM
-        msg["To"]      = ", ".join([a for a in to_addrs if a])
-        msg.set_content(body)
+        # Llamada HTTP POST a la API
+        response = requests.post(SENDGRID_ENDPOINT, headers=headers, json=payload, timeout=15)
         
-        context = ssl.create_default_context()
-        
-        # --- BLOQUE CORREGIDO PARA PUERTO 587 (STARTTLS) ---
-        # Se asume que el puerto 587 está en el .env, por lo que usamos SMTP normal y STARTTLS.
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
-            server.starttls(context=context) # <-- NECESARIO para 587
-            server.login(SMTP_USER, SMTP_PASS)
-            server.send_message(msg)
-        # ----------------------------------------------------
-        
-        print(f"[MAIL] Enviado a {msg['To']}")
-    except Exception as e:
-        print("[MAIL] Error enviando correo:", e)
+        # El código 202 significa éxito (Aceptado para envío)
+        if response.status_code == 202:
+            print(f"[MAIL] Enviado por SendGrid a {recipient_email} (Status 202 Accepted)")
+        else:
+            # Si hay un error, imprimir la respuesta detallada de la API
+            print(f"[MAIL] Error enviando correo (SendGrid): Status {response.status_code}. Respuesta: {response.text}")
+            
+    except requests.exceptions.RequestException as e:
+        print(f"[MAIL] Error de conexión/timeout (SendGrid): {e}")
+
 
 # Helpers de Credenciales
 ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
@@ -312,14 +327,14 @@ def participant_to_row(p: Participant) -> Dict[str, Any]:
         "max_dd": round(p.max_dd, 2),
         "position_size": p.position_size,
         "last_trade": local_time_str,
-        "is_eliminated": p.eliminated, # Aquí se envía el estado de descalificación
+        "is_eliminated": p.eliminated, 
     }
 
 # ====================================================================
 # ========= ENDPOINTS HTTP (RUTAS REST) ==============================
 # ====================================================================
 
-# === 1. RUTA RAIZ HTTP (Soluciona 404/403) ===
+# === 1. RUTA RAIZ HTTP ===
 @app.get("/")
 async def serve_index():
     """Sirve el index.html en la raíz para evitar conflicto con WS/StaticFiles."""
@@ -333,7 +348,7 @@ async def serve_index():
 def ping():
     return {"ok": True, "ts": now_utc().isoformat(), "hmac": USE_HMAC, "participants": len(REGISTRY_BY_KEY)}
 
-# === 2. RUTA DE ESTADO (Límite de Inscripción) ===
+# === 2. RUTA DE ESTADO ===
 @app.get("/status")
 def get_tournament_status():
     """Ruta para que el frontend obtenga el conteo de inscripciones."""
@@ -353,7 +368,7 @@ def get_leaderboard():
     rows.sort(key=lambda r: r["pnl"], reverse=True)
     return {"type": "leaderboard", "asof": now_utc().isoformat(), "rows": rows}
 
-# === 3. RUTA DE INSCRIPCIÓN (Con Límite de 20) ===
+# === 3. RUTA DE INSCRIPCIÓN ===
 @app.post("/register")
 def register_user(data: RegistrationIn, background: BackgroundTasks):
     name = (data.name or "").strip()
@@ -399,6 +414,7 @@ def register_user(data: RegistrationIn, background: BackgroundTasks):
         "RECUERDA LAS REGLAS DE DESCALIFICACIÓN: 1) Máximo 10 micros. 2) Pérdida máxima de -$2000 USD.\n\n"
         f"Tus credenciales de conexión son:\nHandle: {handle}\nAPI_KEY: {api_key}\nSECRET: {secret}\n"
     )
+    # EL ENVÍO AHORA USA LA FUNCIÓN BASADA EN API
     background.add_task(send_email, "✅ Credenciales Torneo Scalperos", body, [email]) 
 
     if MAIL_TO_ADMIN:
@@ -406,7 +422,7 @@ def register_user(data: RegistrationIn, background: BackgroundTasks):
 
     return {"ok": True, "message": "Inscripción registrada. Revisa tu correo para tus credenciales."}
 
-# === 4. RUTA DE TRADE (Con Reglas de Descalificación) ===
+# === 4. RUTA DE TRADE ===
 @app.post("/events/trade")
 async def post_trade(
     ev: TradeEvent,
