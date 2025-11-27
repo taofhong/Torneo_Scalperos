@@ -137,18 +137,12 @@ def send_email(subject: str, body: str, to_addrs: List[str]) -> None:
         
         context = ssl.create_default_context()
         
-        # --- BLOQUE CORREGIDO PARA PUERTO 465 (SMTP_SSL) ---
-        # Si SMTP_PORT es 465, se usará SMTP_SSL.
-        if SMTP_PORT == 465:
-            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15, context=context) as server:
-                server.login(SMTP_USER, SMTP_PASS)
-                server.send_message(msg)
-        # Si SMTP_PORT es 587 (el default), se usa SMTP con STARTTLS.
-        else: 
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
-                server.starttls(context=context)
-                server.login(SMTP_USER, SMTP_PASS)
-                server.send_message(msg)
+        # --- BLOQUE CORREGIDO PARA PUERTO 587 (STARTTLS) ---
+        # Se asume que el puerto 587 está en el .env, por lo que usamos SMTP normal y STARTTLS.
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls(context=context) # <-- NECESARIO para 587
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
         # ----------------------------------------------------
         
         print(f"[MAIL] Enviado a {msg['To']}")
