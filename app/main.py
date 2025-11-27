@@ -34,9 +34,9 @@ engine = create_engine(DB_URL, echo=False, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 # === REGLAS DEL TORNEO ===
-MAX_PARTICIPANTS = 20      # Límite de inscripción
-MAX_MICROS = 10            # Límite de tamaño de posición
-MAX_LOSS = -2000.0         # Límite de Stop Loss / Drawdown máximo (P&L acumulado)
+MAX_PARTICIPANTS = 20       # Límite de inscripción
+MAX_MICROS = 10             # Límite de tamaño de posición
+MAX_LOSS = -2000.0          # Límite de Stop Loss / Drawdown máximo (P&L acumulado)
 
 class Base(DeclarativeBase):
     pass
@@ -86,9 +86,9 @@ class Trade(Base):
 
 class Registration(Base):
     __tablename__ = "registrations"
-    id: Mapped[int]        = mapped_column(Integer, primary_key=True, autoincrement=True)
-    name: Mapped[str]      = mapped_column(String(120))
-    email: Mapped[str]     = mapped_column(String(200), index=True)
+    id: Mapped[int]         = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str]        = mapped_column(String(120))
+    email: Mapped[str]       = mapped_column(String(200), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
 
 class Credentials(Base):
@@ -134,11 +134,23 @@ def send_email(subject: str, body: str, to_addrs: List[str]) -> None:
         msg["From"]    = MAIL_FROM
         msg["To"]      = ", ".join([a for a in to_addrs if a])
         msg.set_content(body)
+        
         context = ssl.create_default_context()
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
-            server.starttls(context=context)
-            server.login(SMTP_USER, SMTP_PASS)
-            server.send_message(msg)
+        
+        # --- BLOQUE CORREGIDO PARA PUERTO 465 (SMTP_SSL) ---
+        # Si SMTP_PORT es 465, se usará SMTP_SSL.
+        if SMTP_PORT == 465:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15, context=context) as server:
+                server.login(SMTP_USER, SMTP_PASS)
+                server.send_message(msg)
+        # Si SMTP_PORT es 587 (el default), se usa SMTP con STARTTLS.
+        else: 
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+                server.starttls(context=context)
+                server.login(SMTP_USER, SMTP_PASS)
+                server.send_message(msg)
+        # ----------------------------------------------------
+        
         print(f"[MAIL] Enviado a {msg['To']}")
     except Exception as e:
         print("[MAIL] Error enviando correo:", e)
@@ -259,7 +271,7 @@ class WSManager:
             except WebSocketDisconnect:
                 dead_connections.append(connection)
             except RuntimeError: # Para manejar "WebSocket has not been accepted"
-                 dead_connections.append(connection)
+                dead_connections.append(connection)
         
         for connection in dead_connections:
             self.disconnect(connection)
@@ -428,27 +440,27 @@ async def post_trade(
                 p.eliminated = True
                 print(f"[RULE FAIL] {p.handle}: Exceso de micros ({abs(ev.position_size)} > {MAX_MICROS})")
 
-        # Actualizar estadísticas
-        new_pnl = p.pnl + ev.realized_pnl
-        p.trades += 1
-        p.wins += (1 if ev.realized_pnl >= 0 else 0)
-        p.losses += (1 if ev.realized_pnl < 0 else 0)
+            # Actualizar estadísticas
+            new_pnl = p.pnl + ev.realized_pnl
+            p.trades += 1
+            p.wins += (1 if ev.realized_pnl >= 0 else 0)
+            p.losses += (1 if ev.realized_pnl < 0 else 0)
 
-        p.peak_equity = max(p.peak_equity, new_pnl)
-        dd = compute_drawdown(p.peak_equity, new_pnl)
-        p.max_dd = min(p.max_dd, dd)
-        p.pnl = new_pnl
+            p.peak_equity = max(p.peak_equity, new_pnl)
+            dd = compute_drawdown(p.peak_equity, new_pnl)
+            p.max_dd = min(p.max_dd, dd)
+            p.pnl = new_pnl
 
-        # Regla 2: Límite de Pérdida Máxima ($2000)
-        if not p.eliminated and p.pnl <= MAX_LOSS:
-            p.eliminated = True
-            print(f"[RULE FAIL] {p.handle}: Pérdida máxima alcanzada ({p.pnl} <= {MAX_LOSS})")
-            
-        p.position_size = ev.position_size
-        p.updated_at = now_utc()
-        p.last_symbol = ev.symbol
-        p.last_price  = ev.price
-
+            # Regla 2: Límite de Pérdida Máxima ($2000)
+            if not p.eliminated and p.pnl <= MAX_LOSS:
+                p.eliminated = True
+                print(f"[RULE FAIL] {p.handle}: Pérdida máxima alcanzada ({p.pnl} <= {MAX_LOSS})")
+                
+            p.position_size = ev.position_size
+            p.updated_at = now_utc()
+            p.last_symbol = ev.symbol
+            p.last_price  = ev.price
+        
         # Guardar el trade
         t = Trade(
             ts=ts, handle=ev.handle, symbol=ev.symbol, qty=ev.qty, price=ev.price,
